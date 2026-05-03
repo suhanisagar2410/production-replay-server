@@ -1,0 +1,33 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id        String   @id @default(uuid())
+  name      String
+  apiKey    String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  replays   Replay[]
+}
+
+model Replay {
+  id           String   @id @default(uuid())
+  projectId    String
+  triggerType  String   // e.g. uncaught_exception, manual, http_error
+  triggerLabel String?
+  errorMessage String?
+  errorStack   String?
+  serviceName  String
+  environment  String
+  durationMs   Int
+  eventCount   Int
+  capturedAt   DateTime @default(now())
+  dataUrl      String   // Path to S3 or local disk containing the full replay JSON
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
