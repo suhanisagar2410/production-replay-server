@@ -1,6 +1,10 @@
 import { CircularBuffer, ExecutionEvent } from './core/circular-buffer';
 import { expressInterceptor } from './interceptors/express';
 import { outgoingHttpInterceptor } from './interceptors/http';
+import { patchPostgres } from './interceptors/postgres';
+import { patchMongoose } from './interceptors/mongodb';
+import { patchRedis } from './interceptors/redis';
+import { ExecutionTracer } from './core/tracer';
 import { uploadReplay } from './uploader';
 import { getRequestId } from './core/async-context';
 
@@ -20,6 +24,7 @@ export class ProductionReplaySdk {
   private serviceName: string;
   private environment: string;
   private isInitialized = false;
+  private tracer: ExecutionTracer | null = null;
 
   constructor() {
     this.buffer = new CircularBuffer(20000, 50);
@@ -43,6 +48,13 @@ export class ProductionReplaySdk {
 
     // Initialize core interceptors immediately
     outgoingHttpInterceptor(this.buffer);
+    patchPostgres(this.buffer);
+    patchMongoose(this.buffer);
+    patchRedis(this.buffer);
+
+    // Initialize the V8 sampling tracer
+    this.tracer = new ExecutionTracer(this.buffer);
+    this.tracer.enable();
 
     // Trap critical execution panics (Uncaught Exceptions & Rejections)
     process.on('uncaughtException', (err) => {
@@ -56,6 +68,7 @@ export class ProductionReplaySdk {
     });
 
     this.isInitialized = true;
+    (globalThis as any).__replaySdkInstance = this;
     console.log(`[Production Replay SDK] Initialized successfully for service: "${this.serviceName}"`);
   }
 

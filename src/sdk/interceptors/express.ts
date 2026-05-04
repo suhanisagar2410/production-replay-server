@@ -41,6 +41,15 @@ export function expressInterceptor(buffer: CircularBuffer, serviceName: string, 
           },
         });
 
+        // 4xx/5xx Auto-trigger
+        if (res.statusCode >= 400) {
+          const sdk = (globalThis as any).__replaySdkInstance;
+          if (sdk && typeof sdk.capture === 'function') {
+            const err = new Error(`HTTP Error status ${res.statusCode} encountered on ${req.method} ${req.url}`);
+            sdk.capture(err, 'http_error', `http_${res.statusCode}_error`);
+          }
+        }
+
         return originalEnd.call(this, chunk, encoding, cb);
       };
 
