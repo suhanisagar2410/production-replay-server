@@ -9,20 +9,32 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 
+import authRouter from './api/auth';
+import { requireAuth } from './middleware/auth';
+app.use('/auth', authRouter);
+
 // Health Check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// Create/Fetch Project
-app.post('/api/projects', async (req, res) => {
+// GET user's projects
+app.get('/api/projects', requireAuth, async (req, res) => {
+  const projects = await prisma.project.findMany({
+    where: { userId: req.user!.id }
+  });
+  res.json(projects);
+});
+
+// Create Project
+app.post('/api/projects', requireAuth, async (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'Project name required' });
 
   // Generating a standard unique API key
   const apiKey = `pr_live_sk_${Math.random().toString(36).substring(2, 11)}`;
   const project = await prisma.project.create({
-    data: { name, apiKey },
+    data: { name, apiKey, userId: req.user!.id },
   });
 
   res.status(201).json(project);
@@ -48,10 +60,18 @@ app.post('/api/projects/seed', async (req, res) => {
   res.json(project);
 });
 
-// GET all replays
-app.get('/api/replays', async (req, res) => {
+// GET all replays for user's projects
+app.get('/api/replays', requireAuth, async (req, res) => {
   const { environment, triggerType } = req.query;
-  const where: any = {};
+  
+  // Find projects belonging to this user
+  const userProjects = await prisma.project.findMany({
+    where: { userId: req.user!.id },
+    select: { id: true }
+  });
+  const projectIds = userProjects.map(p => p.id);
+
+  const where: any = { projectId: { in: projectIds } };
 
   if (environment) where.environment = String(environment);
   if (triggerType) where.triggerType = String(triggerType);
@@ -65,12 +85,20 @@ app.get('/api/replays', async (req, res) => {
 });
 
 // GET replay by ID
-app.get('/api/replays/:id', async (req, res) => {
+app.get('/api/replays/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
-  const replay = await prisma.replay.findUnique({ where: { id } });
+  const replay = await prisma.replay.findUnique({ 
+    where: { id },
+    include: { project: true }
+  });
 
   if (!replay) {
     return res.status(404).json({ error: 'Replay not found' });
+  }
+
+  // Ensure this replay belongs to a project owned by the user
+  if (replay.project.userId !== req.user!.id) {
+    return res.status(403).json({ error: 'Forbidden' });
   }
 
   try {
