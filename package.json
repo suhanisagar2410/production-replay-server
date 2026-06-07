@@ -10,7 +10,7 @@
     "start:demo": "ts-node src/demo-app.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev --name init",
-    "build:render": "npm install && npx prisma generate && npm run build && npx prisma migrate deploy"
+    "build:render": "npm install && npx prisma generate && npm run build && npx prisma db push"
   },
   "keywords": [],
   "author": "",
