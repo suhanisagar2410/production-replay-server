@@ -88,6 +88,25 @@ app.get('/api/replays', requireAuth, async (req, res) => {
   res.json(replays);
 });
 
+// DELETE all replays for user's projects
+app.delete('/api/replays', requireAuth, async (req, res) => {
+  try {
+    const userProjects = await prisma.project.findMany({
+      where: { userId: req.user!.id },
+      select: { id: true }
+    });
+    const projectIds = userProjects.map(p => p.id);
+
+    const result = await prisma.replay.deleteMany({
+      where: { projectId: { in: projectIds } }
+    });
+
+    res.json({ success: true, count: result.count });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete replays' });
+  }
+});
+
 // GET replay by ID
 app.get('/api/replays/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
@@ -111,6 +130,29 @@ app.get('/api/replays/:id', requireAuth, async (req, res) => {
   } catch (err: any) {
     res.status(500).json({ error: `Failed to fetch payload from storage: ${err.message}` });
   }
+});
+
+// GET trace replays by trace ID
+app.get('/api/replays/:id/trace', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const sourceReplay = await prisma.replay.findUnique({ 
+    where: { id },
+    select: { traceId: true, projectId: true, project: { select: { userId: true } } }
+  });
+
+  if (!sourceReplay) return res.status(404).json({ error: 'Replay not found' });
+  if (sourceReplay.project.userId !== req.user!.id) return res.status(403).json({ error: 'Forbidden' });
+  if (!sourceReplay.traceId) return res.json([]);
+
+  const traceReplays = await prisma.replay.findMany({
+    where: { 
+      traceId: sourceReplay.traceId,
+      project: { userId: req.user!.id }
+    },
+    orderBy: { capturedAt: 'asc' }
+  });
+
+  res.json(traceReplays);
 });
 
 // INGEST Replay
@@ -138,6 +180,7 @@ app.post('/api/ingest/replay', async (req, res) => {
     events,
     httpCaptures,
     dbQueries,
+    traceId,
   } = req.body;
 
   if (!triggerType || !serviceName || !events) {
@@ -161,6 +204,7 @@ app.post('/api/ingest/replay', async (req, res) => {
       errorStack,
       serviceName,
       environment: environment || 'production',
+      traceId,
       durationMs: durationMs || 0,
       eventCount: eventCount || events.length,
       dataUrl,
