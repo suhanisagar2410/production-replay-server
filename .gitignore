@@ -15,7 +15,7 @@ prisma/*.db-journal
 *.db-journal
 
 # Replay storage local fallback
-storage/
+/storage/
 
 # Logs
 npm-debug.log*
