@@ -155,8 +155,33 @@ app.get('/api/replays/:id/trace', requireAuth, async (req, res) => {
   res.json(traceReplays);
 });
 
+// Verify API Key
+app.get('/api/ingest/verify', async (req, res) => {
+  const apiKeyHeader = req.headers['x-api-key'] || req.headers['authorization'];
+  if (!apiKeyHeader) return res.status(401).json({ error: 'Unauthorized: missing API Key' });
+
+  const apiKey = String(apiKeyHeader).replace('Bearer ', '');
+  const project = await prisma.project.findUnique({ where: { apiKey } });
+
+  if (!project) {
+    return res.status(401).json({ error: 'Unauthorized: invalid API Key' });
+  }
+
+  res.json({ success: true, project: project.name });
+});
+
+import { rateLimit } from 'express-rate-limit';
+
+const ingestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 requests per `window` (here, per 15 minutes)
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  message: { error: 'Too many requests, please try again later.' }
+});
+
 // INGEST Replay
-app.post('/api/ingest/replay', async (req, res) => {
+app.post('/api/ingest/replay', ingestLimiter, async (req, res) => {
   const apiKeyHeader = req.headers['x-api-key'] || req.headers['authorization'];
   if (!apiKeyHeader) return res.status(401).json({ error: 'Unauthorized: missing API Key' });
 
