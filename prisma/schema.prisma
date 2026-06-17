@@ -55,5 +55,9 @@ model Replay {
   eventCount   Int
   capturedAt   DateTime @default(now())
   dataUrl      String   // Path to S3 or local disk containing the full replay JSON
+  severity     String?  // critical | error | warning | info
+  sdkVersion   String?  // e.g. 1.2.0
+  shareToken   String?  @unique
+  shareExpiresAt DateTime?
   project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
 }

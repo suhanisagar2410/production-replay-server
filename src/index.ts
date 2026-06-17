@@ -25,9 +25,34 @@ app.get('/health', (req, res) => {
 // GET user's projects
 app.get('/api/projects', requireAuth, async (req, res) => {
   const projects = await prisma.project.findMany({
-    where: { userId: req.user!.id }
+    where: { userId: req.user!.id },
+    include: {
+      replays: {
+        where: {
+          capturedAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+          triggerType: { in: ['uncaught_exception', 'unhandled_rejection', 'http_error'] }
+        },
+        select: { id: true }
+      },
+      _count: {
+        select: { replays: true }
+      }
+    }
   });
-  res.json(projects);
+
+  const result = projects.map(p => {
+    const hasRecentErrors = p.replays.length > 0;
+    return {
+      id: p.id,
+      name: p.name,
+      apiKey: p.apiKey,
+      userId: p.userId,
+      replayCount: p._count.replays,
+      isHealthy: !hasRecentErrors
+    };
+  });
+
+  res.json(result);
 });
 
 // Create Project
@@ -66,7 +91,7 @@ app.post('/api/projects/seed', async (req, res) => {
 
 // GET all replays for user's projects
 app.get('/api/replays', requireAuth, async (req, res) => {
-  const { environment, triggerType } = req.query;
+  const { environment, triggerType, projectId } = req.query;
   
   // Find projects belonging to this user
   const userProjects = await prisma.project.findMany({
@@ -75,7 +100,17 @@ app.get('/api/replays', requireAuth, async (req, res) => {
   });
   const projectIds = userProjects.map(p => p.id);
 
-  const where: any = { projectId: { in: projectIds } };
+  let targetProjectIds = projectIds;
+  if (projectId) {
+    const pId = String(projectId);
+    if (projectIds.includes(pId)) {
+      targetProjectIds = [pId];
+    } else {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+  }
+
+  const where: any = { projectId: { in: targetProjectIds } };
 
   if (environment) where.environment = String(environment);
   if (triggerType) where.triggerType = String(triggerType);
@@ -131,6 +166,59 @@ app.get('/api/replays/:id', requireAuth, async (req, res) => {
     res.status(500).json({ error: `Failed to fetch payload from storage: ${err.message}` });
   }
 });
+
+// POST share replay
+app.post('/api/replays/:id/share', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const replay = await prisma.replay.findUnique({
+    where: { id },
+    include: { project: true }
+  });
+
+  if (!replay) {
+    return res.status(404).json({ error: 'Replay not found' });
+  }
+
+  if (replay.project.userId !== req.user!.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  const crypto = await import('crypto');
+  const shareToken = crypto.randomUUID();
+  const shareExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
+  const updated = await prisma.replay.update({
+    where: { id },
+    data: { shareToken, shareExpiresAt }
+  });
+
+  res.json({ shareToken: updated.shareToken, shareExpiresAt: updated.shareExpiresAt });
+});
+
+// GET public shared replay by share token
+app.get('/api/public/replays/:shareToken', async (req, res) => {
+  const { shareToken } = req.params;
+  const replay = await prisma.replay.findUnique({
+    where: { shareToken },
+    include: { project: true }
+  });
+
+  if (!replay) {
+    return res.status(404).json({ error: 'Shared replay not found' });
+  }
+
+  if (replay.shareExpiresAt && replay.shareExpiresAt < new Date()) {
+    return res.status(410).json({ error: 'Shared link has expired' });
+  }
+
+  try {
+    const data = await fetchReplayData(replay.dataUrl);
+    res.json({ ...replay, ...data });
+  } catch (err: any) {
+    res.status(500).json({ error: `Failed to fetch payload from storage: ${err.message}` });
+  }
+});
+
 
 // GET trace replays by trace ID
 app.get('/api/replays/:id/trace', requireAuth, async (req, res) => {
@@ -206,6 +294,8 @@ app.post('/api/ingest/replay', ingestLimiter, async (req, res) => {
     httpCaptures,
     dbQueries,
     traceId,
+    severity,
+    sdkVersion,
   } = req.body;
 
   if (!triggerType || !serviceName || !events) {
@@ -233,6 +323,8 @@ app.post('/api/ingest/replay', ingestLimiter, async (req, res) => {
       durationMs: durationMs || 0,
       eventCount: eventCount || events.length,
       dataUrl,
+      severity: severity || null,
+      sdkVersion: sdkVersion || null,
     },
   });
 
@@ -244,6 +336,7 @@ app.post('/api/ingest/replay', ingestLimiter, async (req, res) => {
 app.get('/api/stats', requireAuth, async (req, res) => {
   try {
     const range = String(req.query.range || '7d');
+    const { projectId } = req.query;
     const days = range === '24h' ? 1 : range === '30d' ? 30 : 7;
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const prevSince = new Date(since.getTime() - days * 24 * 60 * 60 * 1000);
@@ -255,7 +348,17 @@ app.get('/api/stats', requireAuth, async (req, res) => {
     });
     const projectIds = userProjects.map((p) => p.id);
 
-    if (projectIds.length === 0) {
+    let targetProjectIds = projectIds;
+    if (projectId) {
+      const pId = String(projectId);
+      if (projectIds.includes(pId)) {
+        targetProjectIds = [pId];
+      } else {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+
+    if (targetProjectIds.length === 0) {
       return res.json({
         totalReplays: 0, prevTotalReplays: 0,
         errorRate: 0, prevErrorRate: 0,
@@ -266,8 +369,8 @@ app.get('/api/stats', requireAuth, async (req, res) => {
       });
     }
 
-    const where = { projectId: { in: projectIds }, capturedAt: { gte: since } };
-    const prevWhere = { projectId: { in: projectIds }, capturedAt: { gte: prevSince, lt: since } };
+    const where = { projectId: { in: targetProjectIds }, capturedAt: { gte: since } };
+    const prevWhere = { projectId: { in: targetProjectIds }, capturedAt: { gte: prevSince, lt: since } };
 
     const [current, previous] = await Promise.all([
       prisma.replay.findMany({ where }),
