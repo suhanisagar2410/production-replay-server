@@ -41,6 +41,15 @@ export async function uploadReplayData(replayId: string, data: any): Promise<str
 }
 
 export async function fetchReplayData(dataUrl: string): Promise<any> {
+  if (dataUrl === 'dummy.json' || !dataUrl) {
+    return {
+      events: [],
+      httpCaptures: [],
+      dbQueries: [],
+      breadcrumbs: []
+    };
+  }
+
   if (dataUrl.startsWith('local://')) {
     const filename = dataUrl.replace('local://', '');
     const filePath = path.join(LOCAL_STORAGE_DIR, filename);

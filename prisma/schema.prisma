@@ -15,10 +15,11 @@ model User {
   password  String?
   name      String?
   avatarUrl String?
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  projects  Project[]
-  sessions  Session[]
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  projects        Project[]
+  sessions        Session[]
+  assignedReplays Replay[]  @relation("ReplayAssignee")
 }
 
 model Session {
@@ -42,22 +43,36 @@ model Project {
 }
 
 model Replay {
-  id           String   @id @default(uuid())
-  projectId    String
-  triggerType  String   // e.g. uncaught_exception, manual, http_error
-  triggerLabel String?
-  errorMessage String?
-  errorStack   String?
-  serviceName  String
-  environment  String
-  traceId      String?
-  durationMs   Int
-  eventCount   Int
-  capturedAt   DateTime @default(now())
-  dataUrl      String   // Path to S3 or local disk containing the full replay JSON
-  severity     String?  // critical | error | warning | info
-  sdkVersion   String?  // e.g. 1.2.0
-  shareToken   String?  @unique
-  shareExpiresAt DateTime?
-  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  id               String    @id @default(uuid())
+  projectId        String
+  triggerType      String    // e.g. uncaught_exception, manual, http_error
+  triggerLabel     String?
+  errorMessage     String?
+  errorStack       String?
+  serviceName      String
+  environment      String
+  traceId          String?
+  durationMs       Int
+  eventCount       Int
+  capturedAt       DateTime  @default(now())
+  dataUrl          String    // Path to S3 or local disk containing the full replay JSON
+  severity         String?   // critical | error | warning | info
+  sdkVersion       String?   // e.g. 1.2.0
+  shareToken       String?   @unique
+  shareExpiresAt   DateTime?
+  
+  // Phase 2: Workflow & Triage
+  errorFingerprint String?
+  status           String    @default("New") // New | Investigating | Resolved | Ignored
+  assigneeId       String?
+  assignee         User?     @relation("ReplayAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  // Phase 2.3: Release Tracking
+  releaseVersion   String?   // e.g. "v1.4.2" or a semver tag
+  commitSha        String?   // git commit SHA (short or full)
+  
+  // Phase 3: Performance & CPU Profiling
+  cpuProfile       String?   // Serialized V8 CPU profile JSON
+
+  project          Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
 }

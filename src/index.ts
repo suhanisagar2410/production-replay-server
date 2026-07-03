@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import { PrismaClient } from '@prisma/client';
 import { uploadReplayData, fetchReplayData } from './storage/s3';
 
@@ -243,6 +244,38 @@ app.get('/api/replays/:id/trace', requireAuth, async (req, res) => {
   res.json(traceReplays);
 });
 
+// PUT /api/replays/status - Bulk update status and assignee
+app.put('/api/replays/status', requireAuth, async (req, res) => {
+  try {
+    const { projectId, errorFingerprint, status, assigneeId } = req.body;
+    
+    // Verify project ownership
+    const project = await prisma.project.findUnique({ where: { id: projectId } });
+    if (!project || project.userId !== req.user!.id) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    if (!errorFingerprint || !status) {
+      return res.status(400).json({ error: 'Missing fingerprint or status' });
+    }
+
+    const data: any = { status };
+    if (assigneeId !== undefined) {
+      data.assigneeId = assigneeId;
+    }
+
+    const updated = await prisma.replay.updateMany({
+      where: { projectId, errorFingerprint },
+      data
+    });
+
+    res.json({ updated: updated.count });
+  } catch (err) {
+    console.error('Update status error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Verify API Key
 app.get('/api/ingest/verify', async (req, res) => {
   const apiKeyHeader = req.headers['x-api-key'] || req.headers['authorization'];
@@ -296,17 +329,63 @@ app.post('/api/ingest/replay', ingestLimiter, async (req, res) => {
     traceId,
     severity,
     sdkVersion,
+    releaseVersion,
+    commitSha,
+    cpuProfile,
   } = req.body;
 
   if (!triggerType || !serviceName || !events) {
     return res.status(400).json({ error: 'Missing required payload parameters' });
   }
 
+  // Compute a fingerprint to group identical errors
+  const errorFingerprint = (() => {
+    const parts = [];
+    parts.push(triggerType || '');
+    parts.push(serviceName || '');
+    if (errorMessage) {
+      parts.push(errorMessage);
+    } else if (triggerLabel) {
+      parts.push(triggerLabel);
+    }
+    if (errorStack) {
+      parts.push(errorStack.split('\n').slice(0, 2).join('\n'));
+    }
+    return crypto.createHash('sha256').update(parts.join('||')).digest('hex');
+  })();
+
+  const serializedCpuProfile = cpuProfile ? JSON.stringify(cpuProfile) : null;
   const replayId = id || `rpl-${Math.random().toString(36).substring(2, 11)}`;
 
   // Complete payload to save in S3 / disk
   const payloadData = { events, httpCaptures: httpCaptures || [], dbQueries: dbQueries || [] };
   const dataUrl = await uploadReplayData(replayId, payloadData);
+
+  // Auto-reopen and group status inheritance
+  const existingGroup = await prisma.replay.findFirst({
+    where: { projectId: project.id, errorFingerprint },
+    orderBy: { capturedAt: 'desc' }
+  });
+
+  let status = 'New';
+  let assigneeId = null;
+
+  if (existingGroup) {
+    if (existingGroup.status === 'Resolved') {
+      status = 'New';
+      assigneeId = existingGroup.assigneeId; // Re-assign to the same person
+      
+      // Update all past occurrences to 'New' as it has regressed
+      await prisma.replay.updateMany({
+        where: { projectId: project.id, errorFingerprint },
+        data: { status: 'New' }
+      });
+      // TODO: Notify assignee here in the future
+    } else {
+      status = existingGroup.status;
+      assigneeId = existingGroup.assigneeId;
+    }
+  }
 
   // Save metadata to database
   const replay = await prisma.replay.create({
@@ -325,10 +404,202 @@ app.post('/api/ingest/replay', ingestLimiter, async (req, res) => {
       dataUrl,
       severity: severity || null,
       sdkVersion: sdkVersion || null,
+      errorFingerprint,
+      status,
+      assigneeId,
+      releaseVersion: releaseVersion || null,
+      commitSha: commitSha || null,
+      cpuProfile: serializedCpuProfile,
     },
   });
 
   res.status(201).json(replay);
+});
+
+// GET /api/services — get active services and their health status
+app.get('/api/services', requireAuth, async (req, res) => {
+  try {
+    const { projectId } = req.query;
+    
+    // Find projects belonging to this user
+    const userProjects = await prisma.project.findMany({
+      where: { userId: req.user!.id },
+      select: { id: true }
+    });
+    const projectIds = userProjects.map(p => p.id);
+
+    let targetProjectIds = projectIds;
+    if (projectId) {
+      const pId = String(projectId);
+      if (projectIds.includes(pId)) {
+        targetProjectIds = [pId];
+      } else {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+
+    if (targetProjectIds.length === 0) {
+      return res.json([]);
+    }
+
+    // Get unique service names and their replay counts/errors from the last 7 days
+    const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    
+    const replays = await prisma.replay.findMany({
+      where: { 
+        projectId: { in: targetProjectIds },
+        capturedAt: { gte: since }
+      },
+      select: {
+        serviceName: true,
+        triggerType: true
+      }
+    });
+
+    const serviceStats: Record<string, { total: number, errors: number }> = {};
+    replays.forEach(r => {
+      if (!serviceStats[r.serviceName]) {
+        serviceStats[r.serviceName] = { total: 0, errors: 0 };
+      }
+      serviceStats[r.serviceName].total++;
+      if (['uncaught_exception', 'unhandled_rejection', 'http_error'].includes(r.triggerType)) {
+        serviceStats[r.serviceName].errors++;
+      }
+    });
+
+    const result = Object.entries(serviceStats).map(([name, stats]) => {
+      const errorRate = stats.total > 0 ? (stats.errors / stats.total) * 100 : 0;
+      let status = 'ok';
+      if (errorRate > 10) status = 'error';
+      else if (errorRate > 2) status = 'warn';
+      
+      return {
+        name,
+        total: stats.total,
+        errors: stats.errors,
+        errorRate,
+        status
+      };
+    });
+
+    res.json(result);
+  } catch (err: any) {
+    console.error('Services error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── RELEASES ────────────────────────────────────────────────────────────────
+// GET /api/releases — aggregates replays by commitSha / releaseVersion
+app.get('/api/releases', requireAuth, async (req, res) => {
+  try {
+    const { projectId, limit } = req.query;
+    const maxResults = Math.min(parseInt(String(limit || '20')), 50);
+
+    const userProjects = await prisma.project.findMany({
+      where: { userId: req.user!.id },
+      select: { id: true }
+    });
+    const projectIds = userProjects.map(p => p.id);
+
+    let targetProjectIds = projectIds;
+    if (projectId) {
+      const pId = String(projectId);
+      if (projectIds.includes(pId)) {
+        targetProjectIds = [pId];
+      } else {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+
+    if (targetProjectIds.length === 0) return res.json([]);
+
+    // Get all replays with a commitSha or releaseVersion from last 90 days
+    const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+    const replays = await prisma.replay.findMany({
+      where: {
+        projectId: { in: targetProjectIds },
+        capturedAt: { gte: since },
+        OR: [
+          { commitSha: { not: null } },
+          { releaseVersion: { not: null } }
+        ]
+      },
+      select: {
+        commitSha: true,
+        releaseVersion: true,
+        triggerType: true,
+        severity: true,
+        capturedAt: true,
+        errorFingerprint: true,
+        status: true,
+      },
+      orderBy: { capturedAt: 'desc' }
+    });
+
+    // Group by commitSha (fall back to releaseVersion as key)
+    const releaseMap = new Map<string, {
+      commitSha: string | null;
+      releaseVersion: string | null;
+      firstSeen: Date;
+      lastSeen: Date;
+      total: number;
+      errors: number;
+      uniqueErrors: Set<string>;
+      resolved: number;
+    }>();
+
+    replays.forEach(r => {
+      const key = r.commitSha || r.releaseVersion || 'unknown';
+      if (!releaseMap.has(key)) {
+        releaseMap.set(key, {
+          commitSha: r.commitSha,
+          releaseVersion: r.releaseVersion,
+          firstSeen: r.capturedAt,
+          lastSeen: r.capturedAt,
+          total: 0,
+          errors: 0,
+          uniqueErrors: new Set(),
+          resolved: 0,
+        });
+      }
+      const entry = releaseMap.get(key)!;
+      entry.total++;
+      if (r.capturedAt < entry.firstSeen) entry.firstSeen = r.capturedAt;
+      if (r.capturedAt > entry.lastSeen) entry.lastSeen = r.capturedAt;
+
+      const isError = ['uncaught_exception', 'unhandled_rejection', 'http_error'].includes(r.triggerType);
+      if (isError) {
+        entry.errors++;
+        if (r.errorFingerprint) entry.uniqueErrors.add(r.errorFingerprint);
+      }
+      if (r.status === 'Resolved') entry.resolved++;
+    });
+
+    // Convert map to sorted array (most recent first), capped at maxResults
+    const result = Array.from(releaseMap.entries())
+      .sort((a, b) => b[1].lastSeen.getTime() - a[1].lastSeen.getTime())
+      .slice(0, maxResults)
+      .map(([key, data]) => ({
+        key,
+        commitSha: data.commitSha,
+        releaseVersion: data.releaseVersion,
+        firstSeen: data.firstSeen,
+        lastSeen: data.lastSeen,
+        totalReplays: data.total,
+        errorCount: data.errors,
+        uniqueErrorCount: data.uniqueErrors.size,
+        resolvedCount: data.resolved,
+        crashFreeRate: data.total > 0
+          ? Math.max(0, ((data.total - data.errors) / data.total) * 100)
+          : 100,
+      }));
+
+    res.json(result);
+  } catch (err: any) {
+    console.error('Releases error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── DASHBOARD STATS ────────────────────────────────────────────────────────
@@ -464,6 +735,108 @@ app.get('/api/stats', requireAuth, async (req, res) => {
     });
   } catch (err: any) {
     console.error('Stats error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── WEEKLY DIGEST ───────────────────────────────────────────────────────────
+// GET /api/digest — returns a 7-day summary for the Weekly Digest panel
+app.get('/api/digest', requireAuth, async (req, res) => {
+  try {
+    const { projectId } = req.query;
+
+    const userProjects = await prisma.project.findMany({
+      where: { userId: req.user!.id },
+      select: { id: true }
+    });
+    const projectIds = userProjects.map(p => p.id);
+
+    let targetProjectIds = projectIds;
+    if (projectId) {
+      const pId = String(projectId);
+      if (projectIds.includes(pId)) {
+        targetProjectIds = [pId];
+      } else {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+
+    const now = new Date();
+    const thisWeekStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const lastWeekStart = new Date(thisWeekStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    const [thisWeek, lastWeek] = await Promise.all([
+      prisma.replay.findMany({
+        where: { projectId: { in: targetProjectIds }, capturedAt: { gte: thisWeekStart } },
+        select: { id: true, triggerType: true, errorMessage: true, errorFingerprint: true, serviceName: true, severity: true, capturedAt: true }
+      }),
+      prisma.replay.findMany({
+        where: { projectId: { in: targetProjectIds }, capturedAt: { gte: lastWeekStart, lt: thisWeekStart } },
+        select: { id: true, triggerType: true }
+      })
+    ]);
+
+    const isError = (t: string) => ['uncaught_exception', 'unhandled_rejection', 'http_error'].includes(t);
+    const thisErrors = thisWeek.filter(r => isError(r.triggerType));
+    const lastErrors = lastWeek.filter(r => isError(r.triggerType));
+
+    // Top 5 errors by fingerprint frequency
+    const fingerprintCounts: Record<string, { count: number; message: string; service: string; severity: string | null }> = {};
+    thisErrors.forEach(r => {
+      const key = r.errorFingerprint || r.errorMessage || 'unknown';
+      if (!fingerprintCounts[key]) {
+        fingerprintCounts[key] = { count: 0, message: r.errorMessage || r.triggerType, service: r.serviceName, severity: r.severity };
+      }
+      fingerprintCounts[key].count++;
+    });
+    const topErrors = Object.entries(fingerprintCounts)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 5)
+      .map(([, v]) => v);
+
+    // Daily breakdown for sparkline (last 7 days)
+    const dailyMap: Record<string, { total: number; errors: number }> = {};
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const label = d.toLocaleDateString('en-US', { weekday: 'short' });
+      dailyMap[label] = { total: 0, errors: 0 };
+    }
+    thisWeek.forEach(r => {
+      const label = new Date(r.capturedAt).toLocaleDateString('en-US', { weekday: 'short' });
+      if (dailyMap[label]) {
+        dailyMap[label].total++;
+        if (isError(r.triggerType)) dailyMap[label].errors++;
+      }
+    });
+    const dailyBreakdown = Object.entries(dailyMap).map(([label, d]) => ({ label, ...d }));
+
+    // Affected services
+    const serviceSet = new Set(thisErrors.map(r => r.serviceName));
+
+    const totalThisWeek = thisWeek.length;
+    const totalLastWeek = lastWeek.length;
+    const errorsThisWeek = thisErrors.length;
+    const errorsLastWeek = lastErrors.length;
+
+    const weekOverWeekChange = lastErrors.length > 0
+      ? Math.round(((errorsThisWeek - errorsLastWeek) / lastErrors.length) * 100)
+      : errorsThisWeek > 0 ? 100 : 0;
+
+    res.json({
+      period: { from: thisWeekStart, to: now },
+      totalReplays: totalThisWeek,
+      totalReplaysLastWeek: totalLastWeek,
+      totalErrors: errorsThisWeek,
+      totalErrorsLastWeek: errorsLastWeek,
+      weekOverWeekChange,
+      uniqueIssues: Object.keys(fingerprintCounts).length,
+      affectedServices: serviceSet.size,
+      topErrors,
+      dailyBreakdown,
+    });
+  } catch (err: any) {
+    console.error('Digest error:', err);
     res.status(500).json({ error: err.message });
   }
 });
