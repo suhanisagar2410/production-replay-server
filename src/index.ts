@@ -841,6 +841,130 @@ app.get('/api/digest', requireAuth, async (req, res) => {
   }
 });
 
+// ─── GITHUB INTEGRATION ──────────────────────────────────────────────────────────
+
+// POST /api/projects/:id/github - Link a GitHub repository to a project
+app.post('/api/projects/:id/github', requireAuth, async (req, res) => {
+  try {
+    const { githubRepo, githubToken } = req.body;
+    
+    // Verify ownership
+    const project = await prisma.project.findFirst({
+      where: { id: req.params.id, userId: req.user!.id }
+    });
+    
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    
+    const updated = await prisma.project.update({
+      where: { id: project.id },
+      data: { githubRepo, githubToken }
+    });
+    
+    res.json({ success: true, project: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/replays/:id/suspect-commit - Find suspect commit using GitHub API
+app.get('/api/replays/:id/suspect-commit', requireAuth, async (req, res) => {
+  try {
+    const replay = await prisma.replay.findUnique({
+      where: { id: req.params.id },
+      include: { project: true }
+    });
+    
+    if (!replay) return res.status(404).json({ error: 'Replay not found' });
+    if (!replay.project.githubRepo) return res.status(400).json({ error: 'Project not connected to GitHub' });
+    
+    // Parse the error stack to find the first application file
+    const stack = replay.errorStack || '';
+    const match = stack.match(/at\s+.*\((.*):(\d+):(\d+)\)/) || stack.match(/at\s+(.*):(\d+):(\d+)/);
+    
+    if (!match) return res.status(400).json({ error: 'Could not parse stack trace for file/line' });
+    
+    const [, fullPath, lineStr] = match;
+    const lineNumber = parseInt(lineStr, 10);
+    
+    // Extract a relative path (naive assumption: everything after src/)
+    let filePath = fullPath;
+    if (fullPath.includes('src/')) {
+      filePath = 'src/' + fullPath.split('src/')[1];
+    } else {
+      // Just take the filename if we can't figure it out
+      filePath = fullPath.split('/').pop() || fullPath;
+      filePath = filePath.split('\\').pop() || filePath;
+    }
+    
+    // Call GitHub API to get blame for that file
+    const { githubRepo, githubToken } = replay.project;
+    const headers: any = { 'Accept': 'application/vnd.github.v3+json' };
+    if (githubToken) {
+      headers['Authorization'] = `token ${githubToken}`;
+    }
+    
+    // We use GraphQL to get the blame because REST doesn't support line-level blame efficiently
+    const query = `
+      query {
+        repository(owner: "${githubRepo.split('/')[0]}", name: "${githubRepo.split('/')[1]}") {
+          object(expression: "HEAD") {
+            ... on Commit {
+              blame(path: "${filePath}") {
+                ranges {
+                  startingLine
+                  endingLine
+                  commit {
+                    oid
+                    message
+                    committedDate
+                    author {
+                      name
+                      email
+                      avatarUrl
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+    
+    const ghRes = await fetch('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: {
+        ...headers,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ query })
+    });
+    
+    const ghData = await ghRes.json() as any;
+    
+    if (ghData.errors) {
+      return res.status(400).json({ error: 'GitHub API error', details: ghData.errors });
+    }
+    
+    const blame = ghData.data?.repository?.object?.blame;
+    if (!blame) {
+      return res.status(404).json({ error: 'File not found in repository or blame unavailable' });
+    }
+    
+    // Find the commit that introduced the broken line
+    const range = blame.ranges.find((r: any) => lineNumber >= r.startingLine && lineNumber <= r.endingLine);
+    
+    if (!range) {
+      return res.status(404).json({ error: 'Line number not found in blame' });
+    }
+    
+    res.json({ suspectCommit: range.commit, file: filePath, line: lineNumber });
+  } catch (err: any) {
+    console.error('GitHub integration error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`🚀 Production Replay Server listening on port ${PORT}`);
